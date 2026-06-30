@@ -53,6 +53,10 @@ CERT_STORAGE = os.getenv("ECFS_CERT_STORAGE", "하드디스크")
 #  ECFS_CERT_SERIAL : 인증서 시리얼 일부 (NPKI 폴더명에 포함된 값으로 자동 탐색)
 CERT_DIR = os.getenv("ECFS_CERT_DIR", "").strip()
 CERT_SERIAL = os.getenv("ECFS_CERT_SERIAL", "").strip()
+# 다운로드 완료 대기 최대 시간(초). 대용량 사건은 오래 걸리므로 넉넉히. (ECOURT_DL_TIMEOUT 로 조정)
+DOWNLOAD_WAIT_MAX = int(os.getenv("ECOURT_DL_TIMEOUT", "900"))
+# 진행 중(미완료) 다운로드 임시 파일 확장자
+_PARTIAL_EXTS = (".crdownload", ".tmp", ".part", ".download", ".opdownload")
 
 if not USER_ID or not CERT_PW or not CERT_NAME:
     raise SystemExit(
@@ -100,8 +104,29 @@ def prepare_edge_profile():
 
 # ─── SgvDownloader 제어 (별도 스레드) ───────────────────
 
-def handle_downloader():
-    """SgvDownloader가 뜨면: 다운로드 → 암호없이 계속진행 → 완료 대기 → 닫기"""
+def _downloads_snapshot():
+    """Downloads 폴더의 {파일명: 크기} 스냅샷."""
+    snap = {}
+    try:
+        for f in (Path.home() / "Downloads").iterdir():
+            if f.is_file():
+                try:
+                    snap[f.name] = f.stat().st_size
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return snap
+
+
+def handle_downloader(case_no=None):
+    """SgvDownloader가 뜨면: 다운로드 → 암호없이 계속진행 → 완료 대기 → 닫기.
+
+    완료 판정: (1) 다운로더 프로세스 종료, 또는
+              (2) Downloads 에 새 결과 파일이 생기고 임시(.crdownload 등) 없이
+                  크기가 일정 시간 변하지 않으면 완료. (대용량은 받는 동안 계속 대기)
+    """
+    baseline = _downloads_snapshot()  # 다운로드 시작 전 상태
     try:
         from pywinauto import Application
         import pyautogui
@@ -180,10 +205,15 @@ def handle_downloader():
                 break
             time.sleep(1)
 
-        # 3) 다운로드 완료 대기
+        # 3) 다운로드 완료 대기 (파일 기반 감지 + 프로세스 종료)
         print("  [다운로더] 다운로드 진행 중...")
-        for i in range(180):
-            time.sleep(1)
+        started = time.time()
+        stable = 0           # 변화 없이 지속된 초
+        STABLE_NEEDED = 8    # 이만큼 변화 없으면 완료로 판단
+        last_sig = None
+        while time.time() - started < DOWNLOAD_WAIT_MAX:
+            time.sleep(2)
+            # (1) 다운로더가 스스로 종료하면 즉시 완료
             try:
                 if not app.is_process_running():
                     print("  [다운로더] 프로그램 종료 (완료!)")
@@ -191,8 +221,31 @@ def handle_downloader():
             except Exception:
                 print("  [다운로더] 완료!")
                 return
-            if i % 15 == 14:
-                print(f"  [다운로더] 진행 중... ({i+1}초)")
+            # (2) Downloads 변화 감지: baseline 대비 새로 생기거나 커진 파일
+            snap = _downloads_snapshot()
+            changed = {n: s for n, s in snap.items() if baseline.get(n) != s}
+            partial = any(n.lower().endswith(_PARTIAL_EXTS) for n in changed)
+            nonpartial = [n for n in changed if not n.lower().endswith(_PARTIAL_EXTS)]
+            if case_no:
+                matched = [n for n in nonpartial if case_no in n]
+                done_files = matched if matched else nonpartial
+            else:
+                done_files = nonpartial
+            sig = tuple(sorted((n, snap[n]) for n in done_files))
+            if partial or not done_files:
+                stable = 0                      # 아직 받는 중 / 결과 파일 없음
+            elif sig == last_sig:
+                stable += 2
+                if stable >= STABLE_NEEDED:
+                    el = int(time.time() - started)
+                    print(f"  [다운로더] 다운로드 완료 감지 ({el}초, 파일 {len(done_files)}개)")
+                    break
+            else:
+                stable = 0                      # 크기가 또 바뀜 = 계속 받는 중
+            last_sig = sig
+            el = int(time.time() - started)
+            if el % 15 < 2:
+                print(f"  [다운로더] 진행 중... ({el}초)")
 
         # 4) 다운로드 끝났으면 닫기
         print("  [다운로더] 닫기...")
@@ -1013,15 +1066,16 @@ def download_case(page, row_index, case_no, case_info=None):
             print(f"  [{case_no}] 기록열람 실패 - 건너뜀")
             return False
 
-        # 2) 다운로더 스레드 시작
-        dl_thread = threading.Thread(target=handle_downloader, daemon=True)
+        # 2) 다운로더 스레드 시작 (case_no 전달 → 파일 기반 완료 감지)
+        dl_thread = threading.Thread(
+            target=handle_downloader, args=(case_no,), daemon=True)
         dl_thread.start()
 
         # 3) 다운로드 트리거
         trigger_download(view_page)
 
-        # 4) 다운로더 완료 대기
-        dl_thread.join(timeout=300)
+        # 4) 다운로더 완료 대기 (대용량 대비 넉넉히)
+        dl_thread.join(timeout=DOWNLOAD_WAIT_MAX + 60)
 
         # 5) 기록열람 탭 닫기
         close_records_tab(view_page)
