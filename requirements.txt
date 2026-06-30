@@ -1,0 +1,12 @@
+# 브라우저 자동화
+playwright>=1.40
+
+# 환경변수 로드
+python-dotenv>=1.0
+
+# Windows 데스크톱 앱(SgvDownloader) 제어
+pywinauto>=0.6.8
+pyautogui>=0.9.54
+
+# PDF → MD 변환 (pdf_to_md.py 사용 시에만 필요)
+PyMuPDF>=1.23

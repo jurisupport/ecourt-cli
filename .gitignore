@@ -1,0 +1,35 @@
+# ─── 민감정보 / 환경 ───
+.env
+
+# ─── 브라우저 프로필 (인증 정보 포함) ───
+edge_profile/
+
+# ─── 실행 산출물 ───
+output/
+logs/
+cases/
+md_output/
+*.log
+*.pdf
+
+# ─── 운영 데이터 (실제 사건번호 포함 가능) ───
+skip_list.json
+case_list.json
+case_data.json
+
+# ─── 스크린샷 ───
+*.png
+
+# ─── Python ───
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ─── OS / 에디터 ───
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
