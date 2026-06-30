@@ -25,6 +25,7 @@
 import argparse
 import os
 import shutil
+import sys
 import threading
 import time
 from pathlib import Path
@@ -1061,6 +1062,71 @@ def download_case(page, row_index, case_no, case_info=None):
         return False
 
 
+def _is_quickstart(args):
+    """단일 사건 테스트(--case 0 등) 실행인지."""
+    return args.case is not None and len(args.case) == 1
+
+
+def _offer_full_run(page, cases, indices, success):
+    """첫 사건 성공 후 전체 다운로드 제안 (Enter=Yes 기본)."""
+    remaining = [i for i in range(len(cases)) if i not in set(indices)]
+    if not remaining:
+        return indices, success
+    try:
+        ans = input(
+            f"\n[성공] 첫 사건 다운로드 완료! 나머지 {len(remaining)}건도 지금 전부 "
+            f"다운로드할까요? (Y/n, Enter=예): "
+        ).strip().lower()
+    except EOFError:
+        return indices, success
+    if ans not in ("", "y", "yes"):
+        print("  전체 다운로드는 건너뜁니다.")
+        return indices, success
+    print(f"\n전체 {len(remaining)}건 다운로드를 시작합니다...\n")
+    for idx in remaining:
+        case = cases[idx]
+        navigate_to_page(page, case.get("page", 1))
+        time.sleep(1)
+        if download_case(page, case["index"], case["case_no"], case_info=case):
+            success += 1
+    return list(range(len(cases))), success
+
+
+def _print_outro():
+    """직접 실행(대화형) 후 다음 단계 + 관련 도구 + 도움 요청 안내."""
+    py = r".\.venv\Scripts\python.exe"
+    print(f"""
+============================================================
+ 다음 단계 (앞으로 이렇게 쓰세요)
+============================================================
+ - 새 문서만 받아 동기화 + 텔레그램 보고:
+     {py} sync_scheduled.py
+ - 매일 자동 실행(데몬): daily_sync_daemon.py 를 시작프로그램에 등록
+     (주의) 데몬이 매일 돌려면 그 시각에 컴퓨터가 *켜져 있어야* 합니다.
+            절전/최대절전/종료 상태에서는 실행되지 않습니다.
+            노트북이면 전원 연결 + 절전 해제를 권장합니다.
+ - 환경설정 다시: powershell -ExecutionPolicy Bypass -File .\\setup_env.ps1
+
+ 함께 쓰면 좋은 쥬리서포트 도구
+ - jurisupport-plugins (Claude Code 법률 자동화: 사건요약/쟁점/서면 초안):
+     irm https://raw.githubusercontent.com/jurisupport/jurisupport-plugins/main/windows-bootstrap.ps1 | iex
+ - legal-terminal (소송 변호사용 올인원 AI 작업공간):
+     irm https://raw.githubusercontent.com/jurisupport/legal-terminal/main/install.ps1 | iex
+ - 웹: https://jurisupport.com
+
+ 잘 안 되나요? Claude Code 에 아래 내용을 붙여넣고 물어보세요
+ ------------------------------------------------------------
+ ecourt-cli 로 전자소송 자동 다운로드를 쓰는 중인데 잘 안 돼.
+ - 저장소(코드/구조 참고): https://github.com/jurisupport/ecourt-cli
+ - 실행한 명령: (여기에 입력한 명령 붙여넣기)
+ - 화면에 나온 오류 / logs 폴더 최신 .log 내용: (붙여넣기)
+ - output 폴더의 최근 스크린샷도 함께 확인해줘.
+ 원인과 해결 방법을 한국어로 알려줘.
+ ------------------------------------------------------------
+============================================================
+""")
+
+
 # ─── 메인 ──────────────────────────────────────────────
 
 def main():
@@ -1149,10 +1215,17 @@ def main():
                 if ok:
                     success += 1
 
+            # 첫 실행(단일 사건) 성공 시 전체 다운로드 제안 (대화형일 때만)
+            if _is_quickstart(args) and success >= 1 and sys.stdin.isatty():
+                indices, success = _offer_full_run(page, cases, indices, success)
+
             print(f"\n{'='*60}")
             print(f"  완료: {success}/{len(indices)}건 다운로드")
             print(f"  저장 경로: {CASE_OUTPUT_DIR}")
             print(f"{'='*60}")
+
+            if sys.stdin.isatty():
+                _print_outro()
 
         finally:
             context.close()
