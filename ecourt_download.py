@@ -42,6 +42,13 @@ LOGIN_URL = f"{ECOURT_URL}/psp/index.on?m=PSP101M01"
 USER_ID = os.getenv("ECFS_USER_ID")
 CERT_PW = os.getenv("ECFS_CERT_PW")
 CERT_NAME = os.getenv("ECFS_CERT_NAME")
+# 인증서 저장 위치 탭 (브라우저 / 인증서찾기 / 하드디스크 / 이동식디스크 / 스마트인증)
+CERT_STORAGE = os.getenv("ECFS_CERT_STORAGE", "하드디스크")
+# 브라우저 탭에 인증서가 없을 때 '인증서찾기'로 자동 등록하기 위한 NPKI 파일 위치.
+#  ECFS_CERT_DIR    : signCert.der + signPri.key 가 든 폴더 전체 경로 (지정 시 최우선)
+#  ECFS_CERT_SERIAL : 인증서 시리얼 일부 (NPKI 폴더명에 포함된 값으로 자동 탐색)
+CERT_DIR = os.getenv("ECFS_CERT_DIR", "").strip()
+CERT_SERIAL = os.getenv("ECFS_CERT_SERIAL", "").strip()
 
 if not USER_ID or not CERT_PW or not CERT_NAME:
     raise SystemExit(
@@ -234,6 +241,112 @@ def dismiss_security_modal(page):
         time.sleep(1)
 
 
+def _npki_roots():
+    """NPKI 인증서가 있을 수 있는 후보 루트 (사용자/PC 마다 다름)."""
+    import string
+    home = Path.home()
+    roots = [home / sub for sub in (
+        "AppData/LocalLow/NPKI", "AppData/Roaming/NPKI",
+        "AppData/Local/NPKI", "Documents/NPKI",
+    )]
+    # 모든 드라이브 루트의 NPKI / GPKI (USB·외장 포함)
+    for letter in string.ascii_uppercase:
+        roots.append(Path(f"{letter}:/NPKI"))
+        roots.append(Path(f"{letter}:/GPKI"))
+    roots += [Path("C:/Program Files/NPKI"), Path("C:/Program Files (x86)/NPKI")]
+    return roots
+
+
+def iter_cert_dirs():
+    """signCert.der + signPri.key 가 든 인증서 폴더를 모두 순회."""
+    for root in _npki_roots():
+        try:
+            if not root.exists():
+                continue
+        except OSError:
+            continue
+        # NPKI/<CA>/USER/<cert>  및  NPKI/USER/<cert> 구조 모두 지원
+        user_dirs = list(root.glob("*/USER"))
+        direct = root / "USER"
+        if direct.exists():
+            user_dirs.append(direct)
+        for user_dir in user_dirs:
+            try:
+                for d in user_dir.iterdir():
+                    if d.is_dir() and (d / "signCert.der").exists() and (d / "signPri.key").exists():
+                        yield d
+            except OSError:
+                pass
+
+
+def find_cert_files():
+    """브라우저 등록용 NPKI 인증서 파일(signCert.der + signPri.key) 탐색.
+
+    우선순위: ECFS_CERT_DIR > ECFS_CERT_SERIAL 매칭 > ECFS_CERT_NAME 매칭.
+    반환: (der_path, key_path) 또는 None.
+    """
+    if CERT_DIR:
+        d = Path(CERT_DIR)
+        der, key = d / "signCert.der", d / "signPri.key"
+        if der.exists() and key.exists():
+            return der, key
+        print(f"  [경고] ECFS_CERT_DIR 에 인증서 파일 없음: {d}")
+
+    name_matches = []
+    for d in iter_cert_dirs():
+        if CERT_SERIAL and CERT_SERIAL in d.name:
+            return d / "signCert.der", d / "signPri.key"
+        if CERT_NAME and CERT_NAME in d.name:
+            name_matches.append((d / "signCert.der", d / "signPri.key"))
+    return name_matches[0] if name_matches else None
+
+
+def import_cert_via_finder(page):
+    """'인증서찾기' 모달에 der+key 파일을 주입하고 '브라우저에 저장' 체크.
+
+    성공 시 '인증서 암호' 모달이 열린 상태(비밀번호 입력 대기)가 된다.
+    """
+    files = find_cert_files()
+    if not files:
+        return False
+    der, key = files
+    print(f"  인증서 목록에 없음 → 인증서찾기로 브라우저 등록 시도\n    {der.parent.name}")
+
+    # '인증서찾기' 탭 클릭
+    clicked = False
+    for el in page.query_selector_all("div, span, button, a, li"):
+        try:
+            if el.inner_text().strip() == "인증서찾기" and el.is_visible():
+                el.click()
+                clicked = True
+                break
+        except Exception:
+            pass
+    if not clicked:
+        print("  [경고] 인증서찾기 버튼 없음")
+        return False
+    time.sleep(2)
+
+    # 숨은 파일 input 에 der + key 주입
+    try:
+        page.set_input_files("#xwup_openFile", [str(der), str(key)])
+    except Exception as e:
+        print(f"  [경고] set_input_files 실패: {e}")
+        return False
+    time.sleep(3)
+
+    # '인증서를 현재 브라우저에 저장합니다' 체크박스 체크
+    page.evaluate("""() => {
+        for (const cb of document.querySelectorAll("input[type=checkbox]")) {
+            const lbl = (cb.parentElement && cb.parentElement.innerText) || '';
+            if (lbl.includes('브라우저에 저장')) { if (!cb.checked) cb.click(); return; }
+        }
+    }""")
+    time.sleep(1)
+    ss(page, "cert_imported")
+    return True
+
+
 def login(page):
     print("\n[로그인]")
     page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
@@ -278,17 +391,17 @@ def login(page):
         except Exception:
             pass
 
-    # 하드디스크 저장소 선택 + 인증서 목록 로드 대기 (최대 40초 폴링)
+    # 저장 위치 선택 + 인증서 목록 로드 대기 (최대 40초 폴링)
     cert_clicked = False
     for attempt in range(8):
-        # 하드디스크 탭 클릭
+        # 저장 위치 탭 클릭 (ECFS_CERT_STORAGE, 기본 '하드디스크')
         for el in page.query_selector_all("div, span, button, a, li"):
             try:
                 text = el.inner_text().strip()
-                if text == "하드디스크" and el.is_visible():
+                if text == CERT_STORAGE and el.is_visible():
                     el.click()
                     if attempt == 0:
-                        print("  하드디스크 선택")
+                        print(f"  저장 위치 선택: {CERT_STORAGE}")
                     time.sleep(3)
                     break
             except Exception:
@@ -311,26 +424,47 @@ def login(page):
         time.sleep(2)
 
     if not cert_clicked:
-        ss(page, "cert_not_found")
-        raise RuntimeError(
-            f"인증서 목록을 찾을 수 없음 (하드디스크에 '{CERT_NAME}' 인증서 없음)"
-        )
+        # 폴백: 인증서찾기로 NPKI 파일을 브라우저에 등록 (self-healing)
+        if not import_cert_via_finder(page):
+            ss(page, "cert_not_found")
+            raise RuntimeError(
+                f"인증서 목록을 찾을 수 없음 ('{CERT_STORAGE}'에 '{CERT_NAME}' 인증서 없음)"
+            )
 
     time.sleep(2)
     ss(page, "cert_selected")
 
-    pw = page.query_selector("input[type='password']")
+    # 화면에 보이는 '인증서 암호' 입력란 선택 (숨겨진 ID 로그인용 password 필드 제외)
+    def _visible_pw():
+        for cand in page.query_selector_all("input[type='password']"):
+            try:
+                if cand.is_visible():
+                    return cand
+            except Exception:
+                pass
+        return None
+
+    pw = _visible_pw()
+    if pw is None:
+        print("  인증서 암호 입력란 not visible, 대기...")
+        time.sleep(5)
+        pw = _visible_pw()
     if pw:
-        if not pw.is_visible():
-            print("  비밀번호 입력란 not visible, 대기...")
-            time.sleep(5)
         pw.click()
         pw.fill(CERT_PW)
+    else:
+        ss(page, "pw_not_found")
+        raise RuntimeError("인증서 암호 입력란을 찾을 수 없음")
     time.sleep(1)
 
-    confirm = page.query_selector("button:has-text('확인')")
-    if confirm and confirm.is_visible():
-        confirm.click()
+    # 화면에 보이는 '확인' 버튼 클릭 (모달/메인 다이얼로그 공통)
+    for b in page.query_selector_all("button:has-text('확인'), input[value='확인']"):
+        try:
+            if b.is_visible():
+                b.click()
+                break
+        except Exception:
+            pass
 
     time.sleep(8)
     ss(page, "login")
@@ -739,10 +873,12 @@ def trigger_download(page):
     ss(page, "selected")
 
     # dialog 자동 수락 - context 레벨에서 처리하여 TargetClosedError 방지
-    try:
-        page.context.on("dialog", lambda d: d.accept())
-    except Exception:
-        pass
+    def _safe_accept(d):
+        try:
+            d.accept()
+        except Exception:
+            pass
+    page.context.on("dialog", _safe_accept)
 
     # 다운로드 버튼 클릭
     page.click("#mf_girokDownload_wframe_btn_dwld")

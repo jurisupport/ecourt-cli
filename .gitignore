@@ -1,5 +1,7 @@
 # ─── 민감정보 / 환경 ───
 .env
+.env.*
+!.env.example
 
 # ─── 브라우저 프로필 (인증 정보 포함) ───
 edge_profile/

@@ -170,7 +170,8 @@ def main():
 
     # 3) sync 실행 (python.exe 명시 - pythonw에서는 GUI 접근 불가)
     script = PROJECT_DIR / "ecourt_update.py"
-    python_exe = shutil.which('python') or 'python'
+    # 부모와 동일한 인터프리터(venv) 사용 - 시스템 python에는 의존성이 없음
+    python_exe = sys.executable or shutil.which('python') or 'python'
     try:
         with open(log_file, 'wb') as f:
             proc = subprocess.run(
