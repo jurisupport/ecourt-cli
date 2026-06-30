@@ -1,4 +1,4 @@
-﻿<#
+<#
   ecourt-cli 원클릭 설치 스크립트 (Windows PowerShell)
 
   사용법 (PowerShell 한 줄):
