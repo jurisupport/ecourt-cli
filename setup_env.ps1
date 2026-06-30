@@ -4,9 +4,12 @@
 
 .DESCRIPTION
   - 인자 없이 실행      : 대화형으로 모든 값을 입력/수정 (Enter 시 기존값 유지)
-  - -Show              : 현재 .env 값 출력 (비밀번호/토큰은 마스킹)
+  - -Show              : 현재 .env 값 출력 (비밀번호/토큰은 마스킹/암호화표시)
   - -Set "KEY=VALUE"   : 특정 값만 비대화형으로 수정 (여러 개 가능)
   - -ListCerts         : PC 에서 발견된 공동인증서(NPKI) 목록만 출력
+
+  비밀번호/토큰은 Windows DPAPI 로 암호화하여 KEY_ENC 형태로 저장합니다
+  (평문 저장 안 함). 암호화에는 .venv 파이썬 + secret_store.py 가 필요합니다.
 
 .EXAMPLE
   .\setup_env.ps1
@@ -25,14 +28,8 @@ $ErrorActionPreference = 'Stop'
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $EnvPath   = Join-Path $ScriptDir '.env'
 
+# DPAPI 로 암호화 저장하는 비밀 키 (저장 시 KEY_ENC 로 보관)
 $SECRET_KEYS = @('ECFS_CERT_PW', 'TELEGRAM_BOT_TOKEN')
-
-# 관리하는 키 순서 (파일 출력 순서)
-$KEYS = @(
-  'ECFS_USER_ID','ECFS_CERT_PW','ECFS_CERT_NAME','ECFS_CERT_STORAGE',
-  'ECFS_CERT_DIR','ECFS_CERT_SERIAL','ECOURT_CASES_DIR',
-  'TELEGRAM_BOT_TOKEN','TELEGRAM_CHAT_ID','SYNC_TIME'
-)
 
 function Read-EnvFile([string]$path) {
   $h = @{}
@@ -40,7 +37,8 @@ function Read-EnvFile([string]$path) {
     foreach ($line in [System.IO.File]::ReadAllLines($path)) {
       if ($line -match '^\s*#') { continue }
       if ($line -match '^\s*([A-Za-z0-9_]+)\s*=\s*(.*)$') {
-        $h[$matches[1]] = $matches[2].Trim()
+        $val = ($matches[2] -replace '\s+#.*$', '').Trim()
+        $h[$matches[1]] = $val
       }
     }
   }
@@ -58,6 +56,41 @@ function Mask([string]$v) {
   if ([string]::IsNullOrEmpty($v)) { return '(미설정)' }
   if ($v.Length -le 4) { return '****' }
   return ('*' * ($v.Length - 4)) + $v.Substring($v.Length - 4)
+}
+
+function Get-VenvPython {
+  $p = Join-Path $ScriptDir '.venv\Scripts\python.exe'
+  if (Test-Path $p) { return $p }
+  $c = Get-Command python -ErrorAction SilentlyContinue
+  if ($c) { return $c.Source }
+  return $null
+}
+
+# 평문 -> DPAPI 암호문(base64). 실패 시 ok=$false.
+function Protect-Secret([string]$plain) {
+  $py = Get-VenvPython
+  if (-not $py) { return @{ ok = $false } }
+  $env:_ECOURT_SECRET_IN = $plain
+  $b64 = $null
+  try   { $b64 = & $py (Join-Path $ScriptDir 'secret_store.py') 'encrypt-env' }
+  catch { $b64 = $null }
+  finally { Remove-Item Env:\_ECOURT_SECRET_IN -ErrorAction SilentlyContinue }
+  if ([string]::IsNullOrWhiteSpace($b64)) { return @{ ok = $false } }
+  return @{ ok = $true; value = (($b64 | Out-String).Trim()) }
+}
+
+# 비밀값을 $v 에 설정 (암호화되면 KEY_ENC, 실패하면 평문 KEY)
+function Set-SecretValue([hashtable]$v, [string]$key, [string]$plain) {
+  $r = Protect-Secret $plain
+  if ($r.ok) {
+    $v["${key}_ENC"] = $r.value
+    $v.Remove($key) | Out-Null
+    Write-Host "  $key 암호화 저장(DPAPI)" -ForegroundColor Green
+  } else {
+    Write-Host "  [경고] 암호화 도구(.venv 파이썬) 없음 → 평문 저장됨: $key" -ForegroundColor Yellow
+    $v[$key] = $plain
+    $v.Remove("${key}_ENC") | Out-Null
+  }
 }
 
 function Find-Certs {
@@ -93,15 +126,28 @@ function Find-Certs {
 
 function Write-EnvFile([hashtable]$v) {
   function Line([string]$key) {
-    if ($v.ContainsKey($key) -and $v[$key] -ne $null) { return "$key=$($v[$key])" }
+    if ($v.ContainsKey($key) -and $null -ne $v[$key]) { return "$key=$($v[$key])" }
     return "$key="
   }
+  # 비밀키: KEY_ENC 우선, 없으면 평문 KEY, 둘 다 없으면 주석
+  function SecretLines([string]$key, [string]$comment) {
+    $out = @($comment)
+    if ($v["${key}_ENC"]) {
+      $out += "${key}_ENC=$($v["${key}_ENC"])"
+    } elseif ($v[$key]) {
+      $out += '# (주의) 아래는 평문입니다. .venv 파이썬으로 setup 재실행 시 자동 암호화됩니다.'
+      $out += "$key=$($v[$key])"
+    } else {
+      $out += "# ${key}_ENC="
+    }
+    return $out
+  }
+
   $L = @()
   $L += '# ─── 전자소송(ecfs) 로그인 ────────────────────────────────'
   $L += '# 전자소송 사이트(ecfs.scourt.go.kr) 사용자 ID'
   $L += (Line 'ECFS_USER_ID'); $L += ''
-  $L += '# 공동인증서 비밀번호'
-  $L += (Line 'ECFS_CERT_PW'); $L += ''
+  $L += (SecretLines 'ECFS_CERT_PW' '# 공동인증서 비밀번호 (DPAPI 암호화: ECFS_CERT_PW_ENC)'); $L += ''
   $L += '# 인증서 목록에서 선택할 이름 (보통 본인 성명 또는 법인명).'
   $L += (Line 'ECFS_CERT_NAME'); $L += ''
   $L += '# 인증서 저장 위치 탭 (브라우저 / 인증서찾기 / 하드디스크 / 이동식디스크 / 스마트인증)'
@@ -115,8 +161,7 @@ function Write-EnvFile([hashtable]$v) {
   $L += '# 다운로드한 사건기록을 저장할 루트 디렉토리 (클라우드 동기화 폴더 권장).'
   $L += (Line 'ECOURT_CASES_DIR'); $L += ''
   $L += '# ─── 텔레그램 알림 ────────────────────────────────────────'
-  $L += '# @BotFather 봇 토큰'
-  $L += (Line 'TELEGRAM_BOT_TOKEN'); $L += ''
+  $L += (SecretLines 'TELEGRAM_BOT_TOKEN' '# @BotFather 봇 토큰 (DPAPI 암호화: TELEGRAM_BOT_TOKEN_ENC)'); $L += ''
   $L += '# 알림 받을 채팅 ID'
   $L += (Line 'TELEGRAM_CHAT_ID'); $L += ''
   $L += '# ─── 데몬 스케줄 ──────────────────────────────────────────'
@@ -126,6 +171,12 @@ function Write-EnvFile([hashtable]$v) {
   if (Test-Path $EnvPath) { Copy-Item $EnvPath "$EnvPath.bak" -Force }
   $enc = New-Object System.Text.UTF8Encoding($false)
   [System.IO.File]::WriteAllText($EnvPath, ($L -join "`r`n") + "`r`n", $enc)
+}
+
+function Secret-Status([hashtable]$v, [string]$key) {
+  if ($v["${key}_ENC"]) { return '(DPAPI 암호화됨)' }
+  if ($v[$key])         { return (Mask $v[$key]) + ' (평문!)' }
+  return '(미설정)'
 }
 
 # ─────────────────────────────────────────────────────────────
@@ -140,10 +191,13 @@ if ($ListCerts) {
 
 if ($Show) {
   Write-Host "현재 .env ($EnvPath)" -ForegroundColor Cyan
-  foreach ($k in $KEYS) {
-    $val = $cur[$k]
-    if ($SECRET_KEYS -contains $k) { $val = Mask $val }
-    elseif ([string]::IsNullOrEmpty($val)) { $val = '(미설정)' }
+  $order = @('ECFS_USER_ID','ECFS_CERT_PW','ECFS_CERT_NAME','ECFS_CERT_STORAGE',
+             'ECFS_CERT_DIR','ECFS_CERT_SERIAL','ECOURT_CASES_DIR',
+             'TELEGRAM_BOT_TOKEN','TELEGRAM_CHAT_ID','SYNC_TIME')
+  foreach ($k in $order) {
+    if ($SECRET_KEYS -contains $k) { $val = Secret-Status $cur $k }
+    elseif ([string]::IsNullOrEmpty($cur[$k])) { $val = '(미설정)' }
+    else { $val = $cur[$k] }
     Write-Host ("  {0,-20} = {1}" -f $k, $val)
   }
   return
@@ -155,8 +209,8 @@ if ($Set) {
     if ($idx -lt 1) { Write-Host "잘못된 형식(무시): $pair" -ForegroundColor Yellow; continue }
     $k = $pair.Substring(0, $idx).Trim()
     $val = $pair.Substring($idx + 1)
-    $cur[$k] = $val
-    Write-Host "설정: $k" -ForegroundColor Green
+    if ($SECRET_KEYS -contains $k) { Set-SecretValue $cur $k $val }
+    else { $cur[$k] = $val; Write-Host "설정: $k" -ForegroundColor Green }
   }
   Write-EnvFile $cur
   Write-Host ".env 저장 완료 (백업: .env.bak)" -ForegroundColor Green
@@ -165,23 +219,24 @@ if ($Set) {
 
 # ── 대화형 모드 ──────────────────────────────────────────────
 function Ask([string]$desc, [string]$current, [string]$default, [bool]$secret) {
-  if ($secret) { $shown = if ($current) { '(설정됨)' } else { '(미설정)' } }
-  else { if ($current) { $shown = $current } elseif ($default) { $shown = $default } else { $shown = '(미설정)' } }
-  if ($secret) {
-    $sec = Read-Host "$desc [$shown] (Enter=유지)" -AsSecureString
-    $plain = ConvertFrom-SecurePlain $sec
-    if ([string]::IsNullOrEmpty($plain)) { if ($current) { return $current } else { return $default } }
-    return $plain
-  }
+  if ($current) { $shown = $current } elseif ($default) { $shown = $default } else { $shown = '(미설정)' }
   $inp = Read-Host "$desc [$shown] (Enter=유지)"
   if ([string]::IsNullOrEmpty($inp)) { if ($current) { return $current } else { return $default } }
   return $inp
 }
 
+function Ask-Secret([hashtable]$v, [string]$key, [string]$desc) {
+  $has = $v.ContainsKey("${key}_ENC") -or $v.ContainsKey($key)
+  $shown = if ($has) { '(설정됨)' } else { '(미설정)' }
+  $sec = Read-Host "$desc [$shown] (Enter=유지)" -AsSecureString
+  $plain = ConvertFrom-SecurePlain $sec
+  if (-not [string]::IsNullOrEmpty($plain)) { Set-SecretValue $v $key $plain }
+}
+
 Write-Host '=== ecourt-cli .env 셋업 (Enter 누르면 기존값 유지) ===' -ForegroundColor Cyan
 Write-Host '── 전자소송 로그인 ──' -ForegroundColor DarkCyan
 $cur['ECFS_USER_ID']      = Ask '전자소송 사용자 ID'        $cur['ECFS_USER_ID']      ''       $false
-$cur['ECFS_CERT_PW']      = Ask '공동인증서 비밀번호'        $cur['ECFS_CERT_PW']      ''       $true
+Ask-Secret $cur 'ECFS_CERT_PW' '공동인증서 비밀번호'
 $cur['ECFS_CERT_NAME']    = Ask '인증서 이름(본인 성명/법인)' $cur['ECFS_CERT_NAME']   ''       $false
 $cur['ECFS_CERT_STORAGE'] = Ask '인증서 저장 위치 탭'        $cur['ECFS_CERT_STORAGE'] '브라우저' $false
 
@@ -192,7 +247,6 @@ if ($doFind -ne 'n' -and $doFind -ne 'N') {
   if (-not $certs) {
     Write-Host '  발견된 인증서 없음 (USB 라면 꽂은 뒤 다시 실행).' -ForegroundColor Yellow
   } else {
-    # 이름이 일치하는 것 우선 표시
     $nameF = $cur['ECFS_CERT_NAME']
     $ordered = @()
     if ($nameF) { $ordered += ($certs | Where-Object { $_.Name -like "*$nameF*" }) }
@@ -213,8 +267,8 @@ Write-Host '── 저장 폴더 ──' -ForegroundColor DarkCyan
 $cur['ECOURT_CASES_DIR'] = Ask '사건기록 저장 폴더'  $cur['ECOURT_CASES_DIR'] '' $false
 
 Write-Host '── 텔레그램 알림 (선택, 없으면 Enter) ──' -ForegroundColor DarkCyan
-$cur['TELEGRAM_BOT_TOKEN'] = Ask '텔레그램 봇 토큰'  $cur['TELEGRAM_BOT_TOKEN'] '' $true
-$cur['TELEGRAM_CHAT_ID']   = Ask '텔레그램 채팅 ID'  $cur['TELEGRAM_CHAT_ID']   '' $false
+Ask-Secret $cur 'TELEGRAM_BOT_TOKEN' '텔레그램 봇 토큰'
+$cur['TELEGRAM_CHAT_ID'] = Ask '텔레그램 채팅 ID'  $cur['TELEGRAM_CHAT_ID'] '' $false
 
 Write-Host '── 스케줄 ──' -ForegroundColor DarkCyan
 $cur['SYNC_TIME'] = Ask '매일 실행 시각(HH:MM)'  $cur['SYNC_TIME'] '18:03' $false

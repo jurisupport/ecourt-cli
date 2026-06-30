@@ -32,6 +32,8 @@ from pathlib import Path
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
+from secret_store import resolve_secret
+
 load_dotenv()
 
 # ─── 설정 ───────────────────────────────────────────────
@@ -40,7 +42,8 @@ ECOURT_URL = "https://ecfs.scourt.go.kr"
 LOGIN_URL = f"{ECOURT_URL}/psp/index.on?m=PSP101M01"
 
 USER_ID = os.getenv("ECFS_USER_ID")
-CERT_PW = os.getenv("ECFS_CERT_PW")
+# 비밀번호는 ECFS_CERT_PW_ENC(DPAPI 암호문) 우선, 없으면 ECFS_CERT_PW(평문)
+CERT_PW = resolve_secret("ECFS_CERT_PW")
 CERT_NAME = os.getenv("ECFS_CERT_NAME")
 # 인증서 저장 위치 탭 (브라우저 / 인증서찾기 / 하드디스크 / 이동식디스크 / 스마트인증)
 CERT_STORAGE = os.getenv("ECFS_CERT_STORAGE", "하드디스크")

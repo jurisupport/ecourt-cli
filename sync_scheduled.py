@@ -21,6 +21,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from secret_store import resolve_secret
+
 load_dotenv()
 
 # ─── 설정 ───────────────────────────────────────
@@ -31,7 +33,8 @@ LOG_DIR.mkdir(exist_ok=True)
 
 
 def load_bot_token() -> str:
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    # TELEGRAM_BOT_TOKEN_ENC(DPAPI 암호문) 우선, 없으면 평문
+    token = resolve_secret("TELEGRAM_BOT_TOKEN")
     if not token:
         raise RuntimeError(
             "환경변수 TELEGRAM_BOT_TOKEN 가 없습니다. .env 파일에 봇 토큰을 입력하세요."
