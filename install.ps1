@@ -5,7 +5,7 @@
     irm https://raw.githubusercontent.com/jurisupport/ecourt-cli/main/install.ps1 | iex
 
   하는 일:
-    1) Python 없으면 winget 으로 설치
+    1) Python(3.10+) 없으면 winget 또는 python.org 설치 프로그램으로 자동 설치
     2) 소스 내려받기 (git 있으면 clone, 없으면 ZIP)
     3) 가상환경(.venv) + 의존성 + Playwright(Edge) 설치
     4) 이어서 환경설정(.env) 진행 여부 질의
@@ -21,6 +21,30 @@ function Refresh-Path {
   $m = [Environment]::GetEnvironmentVariable('Path','Machine')
   $u = [Environment]::GetEnvironmentVariable('Path','User')
   $env:Path = "$m;$u"
+}
+function Ensure-Tls12 {
+  try { [Net.ServicePointManager]::SecurityProtocol =
+          [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}
+}
+# winget 없이 python.org 설치 프로그램을 직접 받아 조용히 설치 (사용자 권한)
+function Install-PythonViaInstaller {
+  Ensure-Tls12
+  $ver = '3.12.8'
+  $url = "https://www.python.org/ftp/python/$ver/python-$ver-amd64.exe"
+  $exe = Join-Path $env:TEMP "python-$ver-amd64.exe"
+  try {
+    Write-Host "      -> python.org 에서 Python $ver 다운로드..." -ForegroundColor Yellow
+    Invoke-WebRequest $url -OutFile $exe -UseBasicParsing
+    Write-Host '      -> 설치 중(조용히, 1~2분)...' -ForegroundColor Yellow
+    Start-Process -FilePath $exe -Wait -ArgumentList `
+      '/quiet','InstallAllUsers=0','PrependPath=1','Include_pip=1','Include_launcher=1' | Out-Null
+    Remove-Item $exe -ErrorAction SilentlyContinue
+    Refresh-Path
+    return $true
+  } catch {
+    Write-Host "      설치 프로그램 실행 실패: $($_.Exception.Message)" -ForegroundColor Red
+    return $false
+  }
 }
 
 Write-Host ''
@@ -38,19 +62,24 @@ function Py-OK { $v = Get-PyVersion; return ($null -ne $v -and $v -ge [version]'
 
 if (-not (Py-OK)) {
   $cur = Get-PyVersion
-  if (Have python) { Write-Host "[1/4] Python 버전 부족(현재 $cur, 3.10+ 필요)" -ForegroundColor Yellow }
-  else             { Write-Host '[1/4] Python 미설치' -ForegroundColor Yellow }
+  if (Have python) { Write-Host "[1/4] Python 버전 부족(현재 $cur, 3.10+ 필요) -> 자동 설치" -ForegroundColor Yellow }
+  else             { Write-Host '[1/4] Python 미설치 -> 자동 설치를 시도합니다' -ForegroundColor Yellow }
   if (Have winget) {
-    Write-Host '      → winget 으로 Python 3.12 설치/업그레이드...' -ForegroundColor Yellow
-    winget install -e --id Python.Python.3.12 --accept-source-agreements --accept-package-agreements
+    Write-Host '      -> winget 으로 Python 3.12 설치/업그레이드...' -ForegroundColor Yellow
+    try { winget install -e --id Python.Python.3.12 --accept-source-agreements --accept-package-agreements } catch {}
     Refresh-Path
+    if (-not (Py-OK)) { Install-PythonViaInstaller | Out-Null }   # winget 실패 시 직접 설치
   } else {
-    throw 'Python 3.10+ 가 필요한데 winget 이 없습니다. https://www.python.org/downloads/ 에서 설치 후("Add Python to PATH" 체크) 다시 실행하세요.'
+    Install-PythonViaInstaller | Out-Null                          # winget 없으면 바로 직접 설치
   }
 }
 if (-not (Py-OK)) {
-  $cur = Get-PyVersion
-  throw "Python 3.10+ 인식 실패 (현재: $cur). PowerShell 창을 닫고 새로 연 뒤 다시 실행하세요."
+  Write-Host ''
+  Write-Host 'Python 3.10+ 자동 설치에 실패했습니다.' -ForegroundColor Red
+  Write-Host '  방법 1) https://www.python.org/downloads/ 에서 설치 (설치화면에서 "Add Python to PATH" 체크)' -ForegroundColor Yellow
+  Write-Host '  방법 2) 설치 후 PowerShell 을 새로 열고 아래 한 줄을 다시 실행하세요:' -ForegroundColor Yellow
+  Write-Host '    irm https://raw.githubusercontent.com/jurisupport/ecourt-cli/main/install.ps1 | iex' -ForegroundColor Gray
+  return
 }
 Write-Host "[1/4] Python OK ($(python --version 2>&1))" -ForegroundColor Green
 
